@@ -1,0 +1,54 @@
+# ── Secrets ──
+.env
+
+# ── Caches ──
+.polygon_cache/
+.scan_cache/
+__pycache__/
+*.pyc
+
+# ── Backtest / research files (not needed for deployment) ──
+*_backtest*.py
+*_results*.json
+*_validation*.py
+*_diagnostic*
+*_ablation*.py
+*_comparison*.json
+*_improve*
+*_wf_mc*.py
+*_walkforward*.json
+*_sizer_*.py
+dual_strategy*
+thematic_bt*
+filter_and_exit_test.py
+sp500_bt_fast.py
+scanner_polygon.py
+screener.py
+screener_artifact.html
+screener_v2.html
+v5_adaptive*.py
+v5_adaptive*.json
+v5_oos_*.json
+oos_prep.py
+v2_*.py
+v2_*.json
+v3_*.json
+test_signals.csv
+test_sector_filter.csv
+validation_results.json
+unified_*.py
+unified_*.json
+
+# ── Old strategy docs (keep only latest) ──
+Systematic_Breakout_Momentum_Strategy.docx
+Systematic_Breakout_Momentum_Strategy_v1.1.docx
+Systematic_Breakout_Momentum_Strategy_v1.2.docx
+Systematic_Breakout_Momentum_Strategy_v1.3.docx
+Systematic_Breakout_Momentum_Strategy_v2.0.docx
+Systematic_Breakout_Momentum_Strategy_v3.0.docx
+V5_Strategy_Document.docx
+HANDOVER_online_deployment.md
+
+# ── OS junk ──
+.DS_Store
+Thumbs.db
