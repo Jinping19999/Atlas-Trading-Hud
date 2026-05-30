@@ -40,13 +40,16 @@ except ImportError:
                     _k, _v = _line.split("=", 1)
                     os.environ.setdefault(_k.strip(), _v.strip())
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 # ── Import V5 scanner (yfinance-based, no API key needed) ─
 import scanner_v5
+
+# ── SQLite persistence layer ─
+import database as db
 
 # V1 scanner (Polygon-based) — optional, only if scanner_polygon.py exists
 try:
@@ -152,8 +155,13 @@ def _save_v5_scan_cache(scan_result: dict):
 # ── App lifecycle ────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """On startup, load today's cached scans if available."""
+    """On startup, init DB and load today's cached scans if available."""
     global _last_scan, _last_v5_scan
+
+    # Initialize SQLite database
+    db.init_db()
+    log.info(f"SQLite DB ready at {db.DB_PATH}")
+
     if _HAS_V1_SCANNER:
         cached = _load_cached_scan()
         if cached:
@@ -516,6 +524,65 @@ async def get_v5_signal_by_ticker(ticker: str):
         status_code=404,
         detail=f"Ticker {ticker_upper} not found in V5 scan results."
     )
+
+
+# ── Persistence Endpoints (SQLite-backed) ──────────────────────────────────
+
+@app.get("/v5/state")
+async def get_all_state():
+    """
+    Bulk read: returns signal_history, monitor, and archive in one call.
+    Used by frontend on page load to sync from server → localStorage.
+    """
+    return db.get_all_state()
+
+
+@app.get("/v5/signal-history")
+async def get_signal_history():
+    """Return the signal history dict."""
+    return db.get_signal_history()
+
+
+@app.post("/v5/signal-history")
+async def save_signal_history(request: Request):
+    """Save the signal history dict (full replace)."""
+    body = await request.json()
+    ok = db.save_signal_history(body)
+    if not ok:
+        raise HTTPException(500, "Failed to save signal history")
+    return {"status": "ok"}
+
+
+@app.get("/v5/monitor")
+async def get_monitor():
+    """Return active monitor positions."""
+    return db.get_monitor()
+
+
+@app.post("/v5/monitor")
+async def save_monitor(request: Request):
+    """Save active monitor positions (full replace)."""
+    body = await request.json()
+    ok = db.save_monitor(body)
+    if not ok:
+        raise HTTPException(500, "Failed to save monitor")
+    return {"status": "ok"}
+
+
+@app.get("/v5/archive")
+async def get_archive():
+    """Return archived monitor positions."""
+    return db.get_archive()
+
+
+@app.post("/v5/archive")
+async def save_archive(request: Request):
+    """Save archived monitor positions (full replace)."""
+    body = await request.json()
+    ok = db.save_archive(body)
+    if not ok:
+        raise HTTPException(500, "Failed to save archive")
+    return {"status": "ok"}
 
 
 # ── Run directly ─────────────────────────────────────────────────────────────

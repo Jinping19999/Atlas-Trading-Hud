@@ -1,11 +1,14 @@
 # ── Secrets ──
 .env
 
-# ── Caches ──
+# ── Caches & databases ──
 .polygon_cache/
 .scan_cache/
 __pycache__/
 *.pyc
+*.db
+*.db-wal
+*.db-shm
 
 # ── Backtest / research files (not needed for deployment) ──
 *_backtest*.py

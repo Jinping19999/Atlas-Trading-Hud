@@ -340,6 +340,34 @@ function saveTopN(n){localStorage.setItem('v5_hud_topN',n);TOP_N_SECTORS=n;}
 // ===================================================================
 const SIGNAL_HISTORY_KEY = 'v5_hud_signal_history';
 
+// ── Server sync helpers (write-through: localStorage = fast cache, server = durable) ──
+function _postToServer(endpoint, data){
+  fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).catch(()=>{});
+}
+let _serverSynced=false;
+async function syncFromServer(){
+  try{
+    const resp=await fetch('/v5/state');
+    if(!resp.ok)return;
+    const state=await resp.json();
+    if(state.signal_history&&Object.keys(state.signal_history).length>0){
+      localStorage.setItem(SIGNAL_HISTORY_KEY,JSON.stringify(state.signal_history));
+    }
+    if(state.monitor&&state.monitor.length>0){
+      localStorage.setItem(MONITOR_KEY,JSON.stringify(state.monitor));
+    }
+    if(state.archive&&state.archive.length>0){
+      localStorage.setItem(ARCHIVE_KEY,JSON.stringify(state.archive));
+    }
+    _serverSynced=true;
+    console.log('[SYNC] Loaded state from server:',Object.keys(state.signal_history||{}).length,'history entries,',
+      (state.monitor||[]).length,'monitor,',
+      (state.archive||[]).length,'archive');
+  }catch(e){
+    console.warn('[SYNC] Server sync failed, using localStorage:',e.message);
+  }
+}
+
 function getTradingDate(){
   const d=new Date();
   if(d.getDay()===0)d.setDate(d.getDate()-2);
@@ -357,6 +385,7 @@ function loadSignalHistory(){
 
 function saveSignalHistory(history){
   try{localStorage.setItem(SIGNAL_HISTORY_KEY,JSON.stringify(history));}catch{}
+  _postToServer('/v5/signal-history',history);
 }
 
 function recordSignals(todaySignals){
@@ -430,6 +459,7 @@ function loadMonitor(){
 }
 function saveMonitor(positions){
   try{localStorage.setItem(MONITOR_KEY,JSON.stringify(positions));}catch{}
+  _postToServer('/v5/monitor',positions);
 }
 function loadArchive(){
   try{const raw=localStorage.getItem(ARCHIVE_KEY);return raw?JSON.parse(raw):[];}catch{return [];}
@@ -439,6 +469,7 @@ function saveArchive(archive){
     if(archive.length>100)archive=archive.slice(-100);
     localStorage.setItem(ARCHIVE_KEY,JSON.stringify(archive));
   }catch{}
+  _postToServer('/v5/archive',archive);
 }
 
 function addToMonitor(signal){
@@ -1623,9 +1654,12 @@ function updateClock(){
 }
 setInterval(updateClock,1000);updateClock();
 
-// Initial render + auto-scan
-render();
-setTimeout(()=>{runLiveScan();},1000);
+// Initial render: sync from server first, then render + auto-scan
+(async()=>{
+  await syncFromServer();
+  render();
+  setTimeout(()=>{runLiveScan();},1000);
+})();
 </script>
 </body>
 </html>
