@@ -287,6 +287,43 @@ select option { background:var(--panel); color:var(--text); }
   background:rgba(96,165,250,0.08);
 }
 
+/* Exit Alerts Banner */
+.exit-alerts-banner {
+  margin:0; padding:0 24px; border-bottom:1px solid rgba(248,113,113,0.3);
+  background:rgba(248,113,113,0.04); flex-shrink:0;
+}
+.exit-alerts-banner .eab-header {
+  display:flex; align-items:center; gap:8px; padding:10px 0 6px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.12em; color:var(--red);
+}
+.exit-alerts-banner .eab-dot {
+  width:6px; height:6px; border-radius:50%; background:var(--red);
+  animation:alert-pulse 1.5s ease-in-out infinite;
+}
+@keyframes alert-pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.exit-alerts-banner .eab-list { display:flex; flex-direction:column; gap:6px; padding-bottom:10px; }
+.exit-alert-card {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:8px 12px; background:rgba(248,113,113,0.06);
+  border:1px solid rgba(248,113,113,0.2); border-radius:3px;
+}
+.exit-alert-card .eac-left { display:flex; align-items:center; gap:12px; }
+.exit-alert-card .eac-ticker { font-family:var(--mono); font-size:14px; font-weight:700; }
+.exit-alert-card .eac-reason {
+  font-family:var(--mono); font-size:10px; letter-spacing:.06em;
+  padding:2px 6px; border-radius:2px; border:1px solid;
+}
+.exit-alert-card .eac-reason.stop { border-color:var(--red); color:var(--red); background:rgba(248,113,113,0.08); }
+.exit-alert-card .eac-reason.ema { border-color:var(--amber); color:var(--amber); background:rgba(251,191,36,0.08); }
+.exit-alert-card .eac-pnl { font-family:var(--mono); font-size:12px; font-weight:600; }
+.exit-alert-card .eac-right { display:flex; align-items:center; gap:8px; }
+.exit-alert-card .eac-archive-btn {
+  padding:4px 10px; font-family:var(--mono); font-size:9px; letter-spacing:.08em;
+  border:1px solid var(--border); background:transparent; color:var(--dim);
+  cursor:pointer; border-radius:2px; transition:all .12s;
+}
+.exit-alert-card .eac-archive-btn:hover { border-color:var(--red); color:var(--red); }
+
 /* Utility */
 .text-green { color:var(--green); }
 .text-red { color:var(--red); }
@@ -1526,6 +1563,63 @@ function renderStrategy(){
     </div>`;
 }
 
+// ===================================================================
+// EXIT ALERTS BANNER
+// ===================================================================
+function getExitAlerts(){
+  const positions=loadMonitor();
+  return positions.filter(p=>p.status==='stopped'||p.status==='exit_signal');
+}
+
+function renderExitAlerts(){
+  const alerts=getExitAlerts();
+  if(alerts.length===0)return '';
+  return `<div class="exit-alerts-banner">
+    <div class="eab-header">
+      <span class="eab-dot"></span>
+      <span>EXIT ALERTS — ${alerts.length} position${alerts.length>1?'s':''} flagged</span>
+    </div>
+    <div class="eab-list">
+      ${alerts.map(p=>{
+        const isStopped=p.status==='stopped';
+        const reasonClass=isStopped?'stop':'ema';
+        const reasonText=isStopped?'STOP HIT':'BELOW EMA21';
+        const entryPx=p.entryPx||p.entryPrice||0;
+        const currentPx=p.currentPrice||p.currentPx||0;
+        const pnl=p.currentPnl!=null?p.currentPnl:(p.pnlPct!=null?p.pnlPct:(entryPx?((currentPx/entryPx-1)*100):0));
+        const pnlColor=pnl>=0?'var(--green)':'var(--red)';
+        return `<div class="exit-alert-card">
+          <div class="eac-left">
+            <span class="eac-ticker">${p.tk}</span>
+            <span class="eac-reason ${reasonClass}">${reasonText}</span>
+            <span style="font-family:var(--mono);font-size:11px;color:var(--dim)">Entry $${entryPx.toFixed(2)} → $${currentPx.toFixed(2)}</span>
+          </div>
+          <div class="eac-right">
+            <span class="eac-pnl" style="color:${pnlColor}">${pnl>=0?'+':''}${pnl.toFixed(1)}%</span>
+            <button class="eac-archive-btn" data-exit-tk="${p.tk}">ARCHIVE</button>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+function archiveExitPosition(ticker){
+  let positions=loadMonitor();
+  const pos=positions.find(p=>p.tk===ticker);
+  if(!pos)return;
+  const reason=pos.status==='stopped'?'stop_hit':'ema21_exit';
+  pos.status='archived';
+  pos.archiveDate=getTradingDate();
+  pos.archiveReason=reason;
+  positions=positions.filter(p=>p.tk!==ticker);
+  saveMonitor(positions);
+  const archive=loadArchive();
+  archive.push(pos);
+  saveArchive(archive);
+  render();
+}
+
 function render(){
   renderNav();
   const main=document.getElementById('main');
@@ -1537,7 +1631,8 @@ function render(){
     case'backtest':html=renderBacktest();break;
     case'strategy':html=renderStrategy();break;
   }
-  main.innerHTML=`<div class="view active">${html}</div>`;
+  const alertsHtml=renderExitAlerts();
+  main.innerHTML=`${alertsHtml}<div class="view active">${html}</div>`;
   bindEvents();
 }
 
@@ -1626,6 +1721,12 @@ function bindEvents(){
     e.stopPropagation();
     removeFromMonitor(btn.dataset.tk);
     render();
+  }));
+
+  // Exit alert archive buttons
+  document.querySelectorAll('.eac-archive-btn').forEach(btn=>btn.addEventListener('click',(e)=>{
+    e.stopPropagation();
+    archiveExitPosition(btn.dataset.exitTk);
   }));
 
   // Monitor manual add

@@ -263,7 +263,8 @@ def _check_monitor_exits(scan_signals: list) -> int:
     updated_positions = []
 
     for pos in positions:
-        tk = pos.get("ticker", "")
+        # Frontend saves ticker as "tk", backend may also see "ticker"
+        tk = pos.get("tk") or pos.get("ticker", "")
         status = pos.get("status", "active")
 
         if status != "active":
@@ -294,8 +295,9 @@ def _check_monitor_exits(scan_signals: list) -> int:
             continue
 
         px = current["px"]
-        stop = pos.get("stop", 0)
-        entry_px = pos.get("entryPrice", 0)
+        # Frontend uses "stopPx", backend may also see "stop"
+        stop = pos.get("stopPx") or pos.get("stop", 0)
+        entry_px = pos.get("entryPx") or pos.get("entryPrice", 0)
 
         # Update current price on the position
         pos["currentPrice"] = px
