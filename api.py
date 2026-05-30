@@ -881,7 +881,7 @@ async def auto_scan_status():
 
 
 @app.post("/v5/auto-scan-trigger")
-async def trigger_auto_scan():
+async def trigger_auto_scan(background_tasks: BackgroundTasks):
     """
     Manually trigger the auto-scan job (bypasses weekend check).
     Useful for testing or forcing an immediate scan + history merge.
@@ -889,8 +889,8 @@ async def trigger_auto_scan():
     if _v5_scan_running:
         raise HTTPException(409, "A scan is already running")
 
-    # Run in background so we return immediately (force=True skips weekend check)
-    asyncio.create_task(_auto_scan_job(force=True))
+    # Run in background thread (force=True skips weekend check)
+    background_tasks.add_task(_auto_scan_job_sync)
     return {"status": "triggered", "message": "Auto-scan started in background"}
 
 
