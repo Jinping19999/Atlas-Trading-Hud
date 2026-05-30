@@ -393,13 +393,14 @@ def _auto_scan_job_sync():
         })
 
 
-async def _auto_scan_job():
+async def _auto_scan_job(force: bool = False):
     """Async wrapper — runs the blocking scan in a thread pool."""
-    # Skip weekends
-    now_et = datetime.datetime.now(EASTERN)
-    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
-        log.info("AUTO-SCAN skipped (weekend)")
-        return
+    # Skip weekends (unless forced via manual trigger)
+    if not force:
+        now_et = datetime.datetime.now(EASTERN)
+        if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+            log.info("AUTO-SCAN skipped (weekend)")
+            return
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _auto_scan_job_sync)
@@ -882,14 +883,14 @@ async def auto_scan_status():
 @app.post("/v5/auto-scan-trigger")
 async def trigger_auto_scan():
     """
-    Manually trigger the auto-scan job (same as scheduled run).
+    Manually trigger the auto-scan job (bypasses weekend check).
     Useful for testing or forcing an immediate scan + history merge.
     """
     if _v5_scan_running:
         raise HTTPException(409, "A scan is already running")
 
-    # Run in background so we return immediately
-    asyncio.create_task(_auto_scan_job())
+    # Run in background so we return immediately (force=True skips weekend check)
+    asyncio.create_task(_auto_scan_job(force=True))
     return {"status": "triggered", "message": "Auto-scan started in background"}
 
 
