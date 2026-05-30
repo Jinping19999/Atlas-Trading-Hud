@@ -45,6 +45,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+# ── Scheduler for automated daily scans ─
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+
 # ── Import V5 scanner (yfinance-based, no API key needed) ─
 import scanner_v5
 
@@ -152,16 +157,265 @@ def _save_v5_scan_cache(scan_result: dict):
         log.warning(f"Failed to save V5 scan cache: {e}")
 
 
+# ── Auto-scan state ─────────────────────────────────────────────────────────
+_auto_scan_status: dict = {
+    "last_run": None,         # ISO timestamp of last auto-scan
+    "last_result": None,      # "success" / "error"
+    "signals_found": 0,
+    "new_signals": 0,         # signals not in previous history
+    "monitor_updates": 0,     # positions flagged for exit
+    "error": None,
+    "next_run": None,         # when the next scan is scheduled
+}
+
+EASTERN = pytz.timezone("US/Eastern")
+AUTO_SCAN_HOUR = int(os.environ.get("AUTO_SCAN_HOUR", "16"))
+AUTO_SCAN_MINUTE = int(os.environ.get("AUTO_SCAN_MINUTE", "30"))
+
+
+def _merge_signal_history(scan_signals: list) -> int:
+    """
+    Merge today's scan signals into the persisted signal_history.
+    Returns count of brand-new tickers (not seen before).
+    """
+    today = datetime.date.today().isoformat()
+    history = db.get_signal_history()
+    new_count = 0
+
+    today_tickers = set()
+    for sig in scan_signals:
+        tk = sig.get("tk") or sig.get("ticker", "")
+        if not tk:
+            continue
+        today_tickers.add(tk)
+
+        if tk in history:
+            entry = history[tk]
+            last = entry.get("lastSeen", "")
+            # Check if yesterday (consecutive) by comparing date strings
+            entry["lastSeen"] = today
+            entry["daysSeen"] = entry.get("daysSeen", 0) + 1
+            # If lastSeen was the previous trading day, increment consecutive
+            # Simple heuristic: if gap <= 3 calendar days, treat as consecutive
+            if last:
+                try:
+                    last_dt = datetime.date.fromisoformat(last)
+                    gap = (datetime.date.today() - last_dt).days
+                    if gap <= 3:
+                        entry["consecutiveDays"] = entry.get("consecutiveDays", 0) + 1
+                    else:
+                        entry["consecutiveDays"] = 1
+                except ValueError:
+                    entry["consecutiveDays"] = 1
+            else:
+                entry["consecutiveDays"] = 1
+            # Save latest data snapshot
+            entry["lastData"] = {
+                "px": sig.get("px"),
+                "chg": sig.get("chg"),
+                "rsi": sig.get("rsi"),
+                "conv": sig.get("conv"),
+            }
+        else:
+            # Brand new signal
+            new_count += 1
+            history[tk] = {
+                "firstSeen": today,
+                "lastSeen": today,
+                "daysSeen": 1,
+                "consecutiveDays": 1,
+                "lastData": {
+                    "px": sig.get("px"),
+                    "chg": sig.get("chg"),
+                    "rsi": sig.get("rsi"),
+                    "conv": sig.get("conv"),
+                },
+            }
+
+    db.save_signal_history(history)
+    return new_count
+
+
+def _check_monitor_exits(scan_signals: list) -> int:
+    """
+    Check monitored positions against current prices.
+    Flag positions where price hit stop or fell below EMA21.
+    Returns count of positions flagged.
+    """
+    positions = db.get_monitor()
+    if not positions:
+        return 0
+
+    # Build lookup from scan signals
+    price_map = {}
+    for sig in scan_signals:
+        tk = sig.get("tk") or sig.get("ticker", "")
+        if tk:
+            price_map[tk] = {
+                "px": sig.get("px", 0),
+                "ema21": sig.get("ema21", 0),
+                "rsi": sig.get("rsi", 0),
+                "chg": sig.get("chg", 0),
+            }
+
+    flagged = 0
+    archive_candidates = []
+    updated_positions = []
+
+    for pos in positions:
+        tk = pos.get("ticker", "")
+        status = pos.get("status", "active")
+
+        if status != "active":
+            updated_positions.append(pos)
+            continue
+
+        current = price_map.get(tk)
+        if not current:
+            # Ticker not in today's scan — try fetching price via yfinance
+            try:
+                import yfinance as yf
+                tick = yf.Ticker(tk)
+                hist = tick.history(period="5d")
+                if len(hist) > 0:
+                    last_row = hist.iloc[-1]
+                    current = {
+                        "px": float(last_row["Close"]),
+                        "ema21": 0,  # can't compute without more data
+                        "rsi": 0,
+                        "chg": 0,
+                    }
+            except Exception:
+                updated_positions.append(pos)
+                continue
+
+        if not current:
+            updated_positions.append(pos)
+            continue
+
+        px = current["px"]
+        stop = pos.get("stop", 0)
+        entry_px = pos.get("entryPrice", 0)
+
+        # Update current price on the position
+        pos["currentPrice"] = px
+        pos["currentPnl"] = round(((px - entry_px) / entry_px * 100) if entry_px else 0, 2)
+        pos["lastChecked"] = datetime.datetime.now().isoformat()
+
+        # Check stop hit
+        if stop and px <= stop:
+            pos["status"] = "stopped"
+            pos["exitDate"] = datetime.date.today().isoformat()
+            pos["exitPrice"] = px
+            pos["exitReason"] = "Stop hit"
+            flagged += 1
+            archive_candidates.append(pos)
+            continue
+
+        # Check EMA21 exit (price closed below EMA21)
+        ema21 = current.get("ema21", 0)
+        if ema21 and px < ema21:
+            pos["status"] = "exit_signal"
+            pos["exitSignalDate"] = datetime.date.today().isoformat()
+            pos["exitReason"] = f"Below EMA21 ({ema21:.2f})"
+            flagged += 1
+
+        updated_positions.append(pos)
+
+    # Save updated positions
+    db.save_monitor(updated_positions)
+
+    # Archive stopped positions
+    if archive_candidates:
+        archive = db.get_archive()
+        archive.extend(archive_candidates)
+        db.save_archive(archive)
+
+    return flagged
+
+
+def _auto_scan_job_sync():
+    """
+    Synchronous auto-scan job. Runs the V5 scanner, merges signal history,
+    checks monitor exits, and caches results.
+    """
+    global _last_v5_scan, _auto_scan_status
+
+    log.info("═══ AUTO-SCAN starting ═══")
+    t0 = time.time()
+
+    try:
+        # 1. Run the V5 scan
+        result = scanner_v5.v5_scan(
+            tickers_by_sector=None,
+            top_n=2,
+            personal_watchlist=[],
+        )
+
+        # 2. Cache scan results
+        _last_v5_scan = result
+        _save_v5_scan_cache(result)
+
+        # Also persist to SQLite for durability
+        db.kv_set("last_auto_scan", result)
+
+        all_signals = result.get("signals", []) + result.get("personalSignals", [])
+
+        # 3. Merge signal history
+        new_count = _merge_signal_history(all_signals)
+
+        # 4. Check monitor exits
+        exit_count = _check_monitor_exits(all_signals)
+
+        duration = round(time.time() - t0, 1)
+
+        _auto_scan_status.update({
+            "last_run": datetime.datetime.now(EASTERN).isoformat(),
+            "last_result": "success",
+            "signals_found": len(all_signals),
+            "new_signals": new_count,
+            "monitor_updates": exit_count,
+            "error": None,
+            "duration_seconds": duration,
+        })
+
+        log.info(
+            f"═══ AUTO-SCAN complete: {len(all_signals)} signals, "
+            f"{new_count} new, {exit_count} exits flagged ({duration}s) ═══"
+        )
+
+    except Exception as e:
+        log.error(f"═══ AUTO-SCAN failed: {e} ═══", exc_info=True)
+        _auto_scan_status.update({
+            "last_run": datetime.datetime.now(EASTERN).isoformat(),
+            "last_result": "error",
+            "error": str(e),
+        })
+
+
+async def _auto_scan_job():
+    """Async wrapper — runs the blocking scan in a thread pool."""
+    # Skip weekends
+    now_et = datetime.datetime.now(EASTERN)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        log.info("AUTO-SCAN skipped (weekend)")
+        return
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _auto_scan_job_sync)
+
+
 # ── App lifecycle ────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """On startup, init DB and load today's cached scans if available."""
-    global _last_scan, _last_v5_scan
+    """On startup, init DB, load caches, and start the auto-scan scheduler."""
+    global _last_scan, _last_v5_scan, _auto_scan_status
 
     # Initialize SQLite database
     db.init_db()
     log.info(f"SQLite DB ready at {db.DB_PATH}")
 
+    # Load cached scans
     if _HAS_V1_SCANNER:
         cached = _load_cached_scan()
         if cached:
@@ -173,7 +427,39 @@ async def lifespan(app: FastAPI):
         _last_v5_scan = cached_v5
         log.info(f"Loaded cached V5 scan from {cached_v5.get('timestamp', '?')} "
                  f"with {len(cached_v5.get('signals', []))} signals")
+
+    # Also try loading last auto-scan from SQLite (survives deploys)
+    persisted_scan = db.kv_get("last_auto_scan")
+    if persisted_scan and not cached_v5:
+        _last_v5_scan = persisted_scan
+        log.info(f"Loaded persisted auto-scan from SQLite "
+                 f"with {len(persisted_scan.get('signals', []))} signals")
+
+    # ── Start the auto-scan scheduler ──
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        _auto_scan_job,
+        CronTrigger(
+            hour=AUTO_SCAN_HOUR,
+            minute=AUTO_SCAN_MINUTE,
+            day_of_week="mon-fri",
+            timezone=EASTERN,
+        ),
+        id="daily_auto_scan",
+        name="Daily V5 auto-scan",
+        replace_existing=True,
+    )
+    scheduler.start()
+
+    next_run = scheduler.get_job("daily_auto_scan").next_run_time
+    _auto_scan_status["next_run"] = next_run.isoformat() if next_run else None
+    log.info(f"Auto-scan scheduler started — next run: {next_run}")
+
     yield
+
+    # Shutdown scheduler gracefully
+    scheduler.shutdown(wait=False)
+    log.info("Auto-scan scheduler stopped")
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
@@ -583,6 +869,28 @@ async def save_archive(request: Request):
     if not ok:
         raise HTTPException(500, "Failed to save archive")
     return {"status": "ok"}
+
+
+# ── Auto-scan Endpoints ─────────────────────────────────────────────────────
+
+@app.get("/v5/auto-scan-status")
+async def auto_scan_status():
+    """Return the status of the automated daily scan scheduler."""
+    return _auto_scan_status
+
+
+@app.post("/v5/auto-scan-trigger")
+async def trigger_auto_scan():
+    """
+    Manually trigger the auto-scan job (same as scheduled run).
+    Useful for testing or forcing an immediate scan + history merge.
+    """
+    if _v5_scan_running:
+        raise HTTPException(409, "A scan is already running")
+
+    # Run in background so we return immediately
+    asyncio.create_task(_auto_scan_job())
+    return {"status": "triggered", "message": "Auto-scan started in background"}
 
 
 # ── Run directly ─────────────────────────────────────────────────────────────

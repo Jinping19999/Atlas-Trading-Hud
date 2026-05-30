@@ -5,3 +5,5 @@ pandas>=2.1.0
 numpy>=1.24.0
 python-dotenv>=1.0.0
 lxml>=4.9.0
+apscheduler>=3.10.0
+pytz>=2024.1
