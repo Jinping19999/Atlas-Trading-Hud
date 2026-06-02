@@ -755,10 +755,19 @@ async def v5_scan(req: V5ScanRequest = V5ScanRequest()):
     """
     global _last_v5_scan, _v5_scan_running
 
-    # Return cached if today's V5 scan exists and not forced
-    if not req.force and _last_v5_scan.get("date") == datetime.date.today().isoformat():
-        log.info("Returning cached V5 scan (same day, force=false)")
+    # Return cached if today's V5 scan exists, not forced, AND personal watchlist matches
+    cached_date_match = _last_v5_scan.get("date") == datetime.date.today().isoformat()
+    cached_pw = set(_last_v5_scan.get("meta", {}).get("personal_watchlist", []))
+    request_pw = set(req.personal_watchlist)
+    pw_match = request_pw.issubset(cached_pw) or len(request_pw) == 0
+
+    if not req.force and cached_date_match and pw_match:
+        log.info("Returning cached V5 scan (same day, force=false, watchlist matches)")
         return _last_v5_scan
+
+    if not req.force and cached_date_match and not pw_match:
+        log.info("Cached scan exists but personal watchlist changed — forcing re-scan")
+        # Fall through to full scan
 
     if _scan_running or _v5_scan_running:
         raise HTTPException(status_code=409, detail="A scan is already in progress")

@@ -607,6 +607,7 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
             'sector_filtered': len(sector_filtered),
             'signals_found': len(signals),
             'personal_signals': len(personal_signals),
+            'personal_watchlist': personal_watchlist or [],
             'top_n': top_n,
             'duration_seconds': duration,
             'data_source': 'yfinance',
