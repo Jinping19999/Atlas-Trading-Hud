@@ -111,6 +111,7 @@ select option { background:var(--panel); color:var(--text); }
   padding:2px 6px; border-radius:2px; font-weight:600;
 }
 .status-badge.fresh { background:rgba(52,211,153,0.12); color:var(--green); }
+.status-badge.intraday { background:rgba(96,165,250,0.12); color:var(--blue); border:1px solid rgba(96,165,250,0.25); }
 .status-badge.day2 { background:rgba(251,191,36,0.12); color:var(--amber); }
 .status-badge.day3 { background:rgba(55,65,81,0.3); color:var(--faint); }
 
@@ -455,8 +456,10 @@ function mergeWithHistory(todaySignals){
   for(const sig of todaySignals){
     const hist=history[sig.tk];
     const age=hist&&hist.firstSeen!==today?tradingDaysBetween(hist.firstSeen,today):0;
+    const isIntraday=sig.status==='INTRADAY';
     merged.push({...sig, signalAge:0, firstSeen:hist?hist.firstSeen:today,
-      ageLabel:'FRESH', stillValid:true, consecutiveDays:hist?hist.daysSeen.length:1});
+      ageLabel:isIntraday?'INTRADAY':'FRESH', isIntraday:isIntraday,
+      stillValid:true, consecutiveDays:hist?hist.daysSeen.length:1});
   }
 
   for(const [tk,hist] of Object.entries(history)){
@@ -509,7 +512,7 @@ function saveArchive(archive){
   _postToServer('/v5/archive',archive);
 }
 
-function addToMonitor(signal){
+function addToMonitor(signal, source='auto'){
   const positions=loadMonitor();
   if(positions.find(p=>p.tk===signal.tk&&p.status==='active'))return false;
   const pos={
@@ -519,7 +522,8 @@ function addToMonitor(signal){
     pricePath:[{d:getTradingDate(),c:signal.px}],
     currentPx:signal.px, maxPx:signal.px, minPx:signal.px,
     daysHeld:0, pnlPct:0, maxGainPct:0, maxDDPct:0,
-    stopHit:false, trailHit:false, rsStillValid:true, status:'active'
+    stopHit:false, trailHit:false, rsStillValid:true, status:'active',
+    source:source
   };
   positions.push(pos);
   saveMonitor(positions);
@@ -538,7 +542,8 @@ function autoTrackFreshSignals(freshSignals){
   let added=0;
   for(const sig of freshSignals){
     if(!activeTickers.has(sig.tk)){
-      addToMonitor(sig);
+      const source=sig.isIntraday?'intraday_auto':'auto';
+      addToMonitor(sig, source);
       added++;
     }
   }
@@ -969,8 +974,10 @@ async function runLiveScan(){
   const freshCount=mergedSignals.filter(s=>s.stillValid).length;
   const fadingCount=mergedSignals.filter(s=>!s.stillValid).length;
   const meta=data.meta||{};
-  const barLabel=meta.market_closed?`EOD ${meta.bar_date||''}`:`Pre-close ${meta.bar_date||''}`;
-  liveState.scanPhase=`${barLabel} | ${meta.universe_size||'?'} tickers | ${freshCount} fresh${fadingCount>0?' + '+fadingCount+' persisted':''}${(data.personalSignals||[]).length>0?' + '+data.personalSignals.length+' personal':''}${tracked>0?' | '+tracked+' tracked':''} (${meta.duration_seconds||'?'}s)`;
+  const isIntraday=meta.is_intraday||false;
+  const barLabel=meta.market_closed?`EOD ${meta.bar_date||''}`:isIntraday?`LIVE ${meta.bar_date||''}`:`Pre-close ${meta.bar_date||''}`;
+  const signalLabel=isIntraday?'intraday':'fresh';
+  liveState.scanPhase=`${barLabel} | ${meta.universe_size||'?'} tickers | ${freshCount} ${signalLabel}${fadingCount>0?' + '+fadingCount+' persisted':''}${(data.personalSignals||[]).length>0?' + '+data.personalSignals.length+' personal':''}${tracked>0?' | '+tracked+' tracked':''} (${meta.duration_seconds||'?'}s)`;
   liveState.lastScan=new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
   liveState.fetchStats.ok=1;
   render();
@@ -1201,7 +1208,7 @@ function renderScreener(){
       <tbody>${signals.length===0?`<tr><td colspan="9" style="padding:40px;text-align:center;color:var(--dim)">${liveState.scanRunning?'Scanning...':'No signals -- click RUN SCAN'}</td></tr>`
       :signals.map((r,i)=>{try{
         const isFresh=r.stillValid||r.stillValid===undefined;
-        const statusClass=isFresh?'fresh':r.signalAge===1?'day2':'day3';
+        const statusClass=r.isIntraday?'intraday':isFresh?'fresh':r.signalAge===1?'day2':'day3';
         const ageTag=r.ageLabel||'FRESH';
         const rowOpacity=isFresh?1:r.signalAge===1?0.7:0.5;
         const isExpanded=expandedTicker===r.tk;
@@ -1278,6 +1285,7 @@ function renderScreener(){
       ${liveState.personalSignals.length>0?`
       <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px">
         <thead><tr style="font-size:10px;color:var(--dim);letter-spacing:.08em">
+          <th style="text-align:left;padding:4px 8px 4px 0;border-bottom:1px solid var(--border)">STATUS</th>
           <th style="text-align:left;padding:4px 8px 4px 0;border-bottom:1px solid var(--border)">SYMBOL</th>
           <th style="text-align:right;padding:4px 8px 4px 0;border-bottom:1px solid var(--border)">LAST</th>
           <th style="text-align:right;padding:4px 8px 4px 0;border-bottom:1px solid var(--border)">RS21</th>
@@ -1285,14 +1293,18 @@ function renderScreener(){
           <th style="text-align:center;padding:4px 8px 4px 0;border-bottom:1px solid var(--border)">CONV</th>
           <th style="text-align:right;padding:4px 0;border-bottom:1px solid var(--border)">STOP</th>
         </tr></thead>
-        <tbody>${liveState.personalSignals.map(s=>`<tr>
+        <tbody>${liveState.personalSignals.map(s=>{
+          const psBadge=s.status==='INTRADAY'?'intraday':'fresh';
+          const psLabel=s.status==='INTRADAY'?'INTRADAY':'FRESH';
+          return`<tr>
+          <td style="padding:6px 8px 6px 0;border-bottom:1px solid var(--border)"><span class="status-badge ${psBadge}">${psLabel}</span></td>
           <td style="padding:6px 8px 6px 0;border-bottom:1px solid var(--border);font-weight:600;color:var(--amber)">${s.tk} <span style="font-size:10px;color:var(--dim)">${s.sec}</span></td>
           <td style="text-align:right;padding:6px 8px 6px 0;border-bottom:1px solid var(--border)">$${s.px.toFixed(2)}</td>
           <td style="text-align:right;padding:6px 8px 6px 0;border-bottom:1px solid var(--border);color:var(--green);font-weight:600">+${s.rs21}%</td>
           <td style="text-align:right;padding:6px 8px 6px 0;border-bottom:1px solid var(--border)">${s.rsi}</td>
           <td style="text-align:center;padding:6px 8px 6px 0;border-bottom:1px solid var(--border);color:${s.conv==='CONVICTION'?'var(--amber)':'var(--dim)'}">${s.conv==='CONVICTION'?'CONV':'BASE'}</td>
           <td style="text-align:right;padding:6px 0;border-bottom:1px solid var(--border)">$${s.stop}</td>
-        </tr>`).join('')}</tbody>
+        </tr>`}).join('')}</tbody>
       </table>`:''}
       ${liveState.personalSignals.length===0&&liveState.personalStatus.length>0?`
       <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">${liveState.personalStatus.map(ps=>{
@@ -1336,7 +1348,7 @@ function renderMonitor(){
     <div class="section-head">
       <div>
         <h2>Monitor</h2>
-        <div class="sub">Forward test tracker. Auto-tracks FRESH signals for ${MONITOR_DAYS} days. Run scan to update.</div>
+        <div class="sub">Forward test tracker. Auto-tracks signals (FRESH + INTRADAY) for ${MONITOR_DAYS} days. Intraday signals removed after close if unconfirmed.</div>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
         <input id="monitorAddInput" type="text" placeholder="Add ticker..." style="padding:5px 10px;background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:11px;width:110px;border-radius:2px;outline:none"/>
@@ -1355,7 +1367,7 @@ function renderMonitor(){
 
     ${active.length===0?`<div style="padding:48px 40px;text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px">
       <div style="font-family:var(--mono);font-size:12px;color:var(--dim)">NO ACTIVE POSITIONS</div>
-      <div style="margin-top:6px;font-size:13px;color:var(--faint)">Run a scan -- FRESH signals are auto-tracked here for ${MONITOR_DAYS} days.</div>
+      <div style="margin-top:6px;font-size:13px;color:var(--faint)">Run a scan -- signals are auto-tracked here for ${MONITOR_DAYS} days.</div>
     </div>`:`
     <div class="monitor-grid">
       ${active.map(p=>{
@@ -1364,7 +1376,7 @@ function renderMonitor(){
         return `<div class="monitor-card ${cardClass}">
           <button class="mc-remove" data-tk="${p.tk}" title="Remove">x</button>
           <div class="mc-head">
-            <span class="mc-ticker">${p.tk} <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">${p.sec}</span></span>
+            <span class="mc-ticker">${p.tk} <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">${p.sec}</span>${p.source==='intraday_auto'?'<span class="status-badge intraday" style="margin-left:6px;font-size:9px">INTRADAY</span>':''}</span>
             <span class="mc-pnl" style="color:${pnlColor}">${p.pnlPct>=0?'+':''}${p.pnlPct.toFixed(1)}%</span>
           </div>
           <div style="margin-bottom:10px">${renderMonitorSparkline(p.pricePath,p.entryPx)}</div>

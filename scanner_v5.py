@@ -184,21 +184,30 @@ def _market_is_closed():
     return False
 
 
-def _drop_today_if_incomplete(data_dict):
+def _drop_today_if_incomplete(data_dict, keep_intraday=False):
     """
-    If market is still open, drop today's partial bar from all DataFrames.
-    This prevents signal flicker from intraday price changes.
-    Returns (cleaned_dict, bar_date_label) where bar_date_label is the
-    date of the last bar used for signals.
+    Handle today's bar depending on market state.
+    - Market closed → keep today's bar (it's confirmed).
+    - Market open + keep_intraday=True → keep today's partial bar for intraday signals.
+    - Market open + keep_intraday=False → drop today's bar (old behaviour).
+    Returns (cleaned_dict, bar_date_label, is_intraday) where is_intraday=True
+    means the last bar is a live/partial bar during market hours.
     """
     if _market_is_closed():
         # Market closed — today's bar is the confirmed close
         sample = next(iter(data_dict.values()), None)
         bar_date = str(sample.index[-1].date()) if sample is not None and len(sample) > 0 else 'today'
         log.info(f"  Market closed — using confirmed bar: {bar_date}")
-        return data_dict, bar_date
+        return data_dict, bar_date, False
 
-    # Market open — drop today's incomplete bar
+    if keep_intraday:
+        # Market open — KEEP today's partial bar for intraday scanning
+        sample = next(iter(data_dict.values()), None)
+        bar_date = str(sample.index[-1].date()) if sample is not None and len(sample) > 0 else 'today'
+        log.info(f"  Market OPEN — keeping intraday bars (live prices), bar: {bar_date}")
+        return data_dict, bar_date, True
+
+    # Market open — drop today's incomplete bar (legacy behaviour)
     today_str = datetime.date.today().strftime('%Y-%m-%d')
     cleaned = {}
     dropped = 0
@@ -215,7 +224,7 @@ def _drop_today_if_incomplete(data_dict):
     sample = next(iter(cleaned.values()), None)
     bar_date = str(sample.index[-1].date()) if sample is not None and len(sample) > 0 else 'yesterday'
     log.info(f"  Market OPEN — dropped {dropped} partial bars, using last confirmed: {bar_date}")
-    return cleaned, bar_date
+    return cleaned, bar_date, False
 
 
 # ── Data fetching via yfinance ──────────────────────────────────────────────
@@ -375,7 +384,7 @@ def _build_signal(tk, tk_df, sec, spy_ret21):
 
 
 # ── Core V5 scan logic ──────────────────────────────────────────────────────
-def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
+def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None, allow_intraday=True):
     """
     Run the V5 Adaptive Momentum scan.
 
@@ -384,6 +393,9 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
                            Defaults to DEFAULT_UNIVERSE.
         top_n: number of top sectors to allow (default 2).
         personal_watchlist: list of tickers to scan without sector filter.
+        allow_intraday: if True, keep today's partial bar during market hours
+                        and tag signals as INTRADAY. If False, drop partial bars
+                        (legacy behaviour used by auto-scan for confirmed-only).
 
     Returns:
         dict with keys: regime, sectors, signals, weeklyPerformers,
@@ -413,9 +425,9 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
     log.info("Phase 1: Fetching SPY + sector ETFs")
     phase1_tickers = ['SPY'] + SECTOR_ETFS
     phase1_data = fetch_bulk(phase1_tickers, start, end)
-    phase1_data, bar_date = _drop_today_if_incomplete(phase1_data)
+    phase1_data, bar_date, is_intraday = _drop_today_if_incomplete(phase1_data, keep_intraday=allow_intraday)
     t1 = round(time.time() - t0, 1)
-    log.info(f"  Phase 1 download: {t1}s, got {len(phase1_data)}/{len(phase1_tickers)} tickers (bar: {bar_date})")
+    log.info(f"  Phase 1 download: {t1}s, got {len(phase1_data)}/{len(phase1_tickers)} tickers (bar: {bar_date}, intraday={is_intraday})")
 
     spy_df = phase1_data.get('SPY')
     if spy_df is None or len(spy_df) < 50:
@@ -490,7 +502,7 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
     if regime_bull and sector_filtered:
         log.info(f"Phase 3: Fetching {len(sector_filtered)} tickers in bulk")
         phase3_data = fetch_bulk(sector_filtered, start, end)
-        phase3_data, _ = _drop_today_if_incomplete(phase3_data)
+        phase3_data, _, _ = _drop_today_if_incomplete(phase3_data, keep_intraday=allow_intraday)
         t3 = round(time.time() - t0, 1)
         log.info(f"  Phase 3 download: {t3}s total, got {len(phase3_data)}/{len(sector_filtered)} tickers")
 
@@ -517,10 +529,11 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
             # Apply V5 filter chain
             sig = _build_signal(tk, tk_df, sec, spy_ret21)
             if sig is not None:
+                sig['status'] = 'INTRADAY' if is_intraday else 'FRESH'
                 signals.append(sig)
 
         signals.sort(key=lambda s: s['rs21'], reverse=True)
-        log.info(f"  Phase 3 signals: {len(signals)} found")
+        log.info(f"  Phase 3 signals: {len(signals)} found (status={'INTRADAY' if is_intraday else 'FRESH'})")
 
     # Weekly performers (top 15 by 5d RS)
     weekly_performers = sorted(
@@ -546,7 +559,7 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
     if personal_watchlist:
         log.info(f"Phase 3b: Personal watchlist ({len(personal_watchlist)} tickers)")
         pw_data = fetch_bulk(personal_watchlist, start, end)
-        pw_data, _ = _drop_today_if_incomplete(pw_data)
+        pw_data, _, _ = _drop_today_if_incomplete(pw_data, keep_intraday=allow_intraday)
 
         for tk in personal_watchlist:
             sec = _TICKER_TO_SECTOR.get(tk, get_sector_for_ticker(tk))
@@ -589,6 +602,7 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
             if sig is not None:
                 sig['sectorInUptrend'] = sec_up
                 sig['inTopSector'] = sec_in_top
+                sig['status'] = 'INTRADAY' if is_intraday else 'FRESH'
                 personal_signals.append(sig)
 
     duration = round(time.time() - t0, 1)
@@ -613,5 +627,6 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None):
             'data_source': 'yfinance',
             'bar_date': bar_date,
             'market_closed': _market_is_closed(),
+            'is_intraday': is_intraday,
         },
     }

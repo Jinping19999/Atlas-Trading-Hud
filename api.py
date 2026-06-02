@@ -336,10 +336,53 @@ def _check_monitor_exits(scan_signals: list) -> int:
     return flagged
 
 
+def _cleanup_intraday_signals(confirmed_tickers: set) -> int:
+    """
+    Post-close cleanup: remove INTRADAY monitor positions that didn't
+    confirm on the closing bar. Returns count of positions removed.
+    """
+    positions = db.get_monitor()
+    if not positions:
+        return 0
+
+    cleaned = []
+    removed = 0
+    archive = db.get_archive()
+
+    for pos in positions:
+        tk = pos.get("tk") or pos.get("ticker", "")
+        src = pos.get("source", "")
+
+        # Only clean up positions that were auto-added from intraday signals
+        if src == "intraday_auto":
+            if tk not in confirmed_tickers:
+                # Signal didn't confirm on close — archive as "not_confirmed"
+                pos["status"] = "archived"
+                pos["archiveDate"] = datetime.date.today().isoformat()
+                pos["archiveReason"] = "intraday_not_confirmed"
+                archive.append(pos)
+                removed += 1
+                log.info(f"  Removed intraday position {tk} — didn't confirm on close")
+                continue
+            else:
+                # Confirmed! Upgrade source from intraday_auto to confirmed
+                pos["source"] = "confirmed_auto"
+                log.info(f"  Confirmed intraday position {tk} — keeping in monitor")
+
+        cleaned.append(pos)
+
+    if removed > 0:
+        db.save_monitor(cleaned)
+        db.save_archive(archive)
+
+    return removed
+
+
 def _auto_scan_job_sync():
     """
-    Synchronous auto-scan job. Runs the V5 scanner, merges signal history,
-    checks monitor exits, and caches results.
+    Synchronous auto-scan job. Runs the V5 scanner with allow_intraday=False
+    (post-close confirmed bars), merges signal history, checks monitor exits,
+    and cleans up intraday positions that didn't confirm.
     """
     global _last_v5_scan, _auto_scan_status
 
@@ -347,11 +390,12 @@ def _auto_scan_job_sync():
     t0 = time.time()
 
     try:
-        # 1. Run the V5 scan
+        # 1. Run the V5 scan — allow_intraday=False for confirmed close bars
         result = scanner_v5.v5_scan(
             tickers_by_sector=None,
             top_n=2,
             personal_watchlist=[],
+            allow_intraday=False,
         )
 
         # 2. Cache scan results
@@ -362,12 +406,16 @@ def _auto_scan_job_sync():
         db.kv_set("last_auto_scan", result)
 
         all_signals = result.get("signals", []) + result.get("personalSignals", [])
+        confirmed_tickers = set(s.get("tk", "") for s in all_signals)
 
         # 3. Merge signal history
         new_count = _merge_signal_history(all_signals)
 
         # 4. Check monitor exits
         exit_count = _check_monitor_exits(all_signals)
+
+        # 5. Cleanup intraday positions that didn't confirm on close
+        intraday_removed = _cleanup_intraday_signals(confirmed_tickers)
 
         duration = round(time.time() - t0, 1)
 
@@ -377,13 +425,15 @@ def _auto_scan_job_sync():
             "signals_found": len(all_signals),
             "new_signals": new_count,
             "monitor_updates": exit_count,
+            "intraday_removed": intraday_removed,
             "error": None,
             "duration_seconds": duration,
         })
 
         log.info(
             f"═══ AUTO-SCAN complete: {len(all_signals)} signals, "
-            f"{new_count} new, {exit_count} exits flagged ({duration}s) ═══"
+            f"{new_count} new, {exit_count} exits flagged, "
+            f"{intraday_removed} intraday removed ({duration}s) ═══"
         )
 
     except Exception as e:
@@ -736,12 +786,13 @@ class V5ScanResponse(BaseModel):
     meta: dict
 
 
-def _run_v5_scan_sync(top_n: int, personal_watchlist: list[str]) -> dict:
+def _run_v5_scan_sync(top_n: int, personal_watchlist: list[str], allow_intraday: bool = True) -> dict:
     """Execute V5 scan synchronously (called from thread pool)."""
     return scanner_v5.v5_scan(
         tickers_by_sector=None,  # use default universe
         top_n=top_n,
         personal_watchlist=personal_watchlist,
+        allow_intraday=allow_intraday,
     )
 
 
@@ -761,7 +812,21 @@ async def v5_scan(req: V5ScanRequest = V5ScanRequest()):
     request_pw = set(req.personal_watchlist)
     pw_match = request_pw.issubset(cached_pw) or len(request_pw) == 0
 
-    if not req.force and cached_date_match and pw_match:
+    # During intraday, allow re-scan every 5 minutes (prices change)
+    cached_is_intraday = _last_v5_scan.get("meta", {}).get("is_intraday", False)
+    cache_stale = False
+    if cached_is_intraday and cached_date_match:
+        cached_ts = _last_v5_scan.get("timestamp", "")
+        try:
+            cached_time = datetime.datetime.fromisoformat(cached_ts)
+            age_minutes = (datetime.datetime.now() - cached_time).total_seconds() / 60
+            if age_minutes > 5:
+                cache_stale = True
+                log.info(f"Intraday cache is {age_minutes:.0f}m old — will re-scan for fresh prices")
+        except (ValueError, TypeError):
+            cache_stale = True
+
+    if not req.force and cached_date_match and pw_match and not cache_stale:
         log.info("Returning cached V5 scan (same day, force=false, watchlist matches)")
         return _last_v5_scan
 
@@ -777,7 +842,7 @@ async def v5_scan(req: V5ScanRequest = V5ScanRequest()):
         try:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
-                None, _run_v5_scan_sync, req.top_n, req.personal_watchlist
+                None, _run_v5_scan_sync, req.top_n, req.personal_watchlist, True
             )
             _last_v5_scan = result
             _save_v5_scan_cache(result)
