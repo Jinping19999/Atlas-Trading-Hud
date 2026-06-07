@@ -228,42 +228,65 @@ def _drop_today_if_incomplete(data_dict, keep_intraday=False):
 
 
 # ── Data fetching via yfinance ──────────────────────────────────────────────
+BULK_CHUNK_SIZE = 100   # max tickers per yfinance download call
+
+
 def fetch_bulk(tickers, start, end):
     """
     Bulk-fetch OHLCV data for multiple tickers via yfinance.
     Returns dict of ticker → DataFrame (columns: Open, High, Low, Close, Volume).
-    Single yf.download() call — all tickers in one shot.
+    Downloads in chunks of BULK_CHUNK_SIZE to avoid yfinance timeouts on large lists.
     """
     if not tickers:
         return {}
 
     tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
 
-    try:
-        raw = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-            group_by='ticker',
-            threads=True,
-        )
-    except Exception as e:
-        log.error(f"yfinance bulk download failed: {e}")
-        return {}
-
-    if raw.empty:
-        return {}
+    # Split into chunks to prevent yfinance from choking on 500+ tickers
+    chunks = [tickers[i:i + BULK_CHUNK_SIZE] for i in range(0, len(tickers), BULK_CHUNK_SIZE)]
+    if len(chunks) > 1:
+        log.info(f"  Splitting {len(tickers)} tickers into {len(chunks)} chunks of ≤{BULK_CHUNK_SIZE}")
 
     result = {}
-    for tk in tickers:
+    for ci, chunk in enumerate(chunks):
         try:
-            tk_df = raw[tk].dropna(subset=['Close'])
-            if len(tk_df) > 0:
-                result[tk] = tk_df
-        except (KeyError, TypeError):
+            raw = yf.download(
+                chunk,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                group_by='ticker',
+                threads=True,
+            )
+        except Exception as e:
+            log.error(f"yfinance bulk download chunk {ci+1}/{len(chunks)} failed: {e}")
             continue
+
+        if raw.empty:
+            continue
+
+        # When only 1 ticker in chunk, yfinance returns flat columns (not multi-level)
+        if len(chunk) == 1:
+            tk = chunk[0]
+            try:
+                tk_df = raw.dropna(subset=['Close'])
+                if len(tk_df) > 0:
+                    result[tk] = tk_df
+            except (KeyError, TypeError):
+                pass
+            continue
+
+        for tk in chunk:
+            try:
+                tk_df = raw[tk].dropna(subset=['Close'])
+                if len(tk_df) > 0:
+                    result[tk] = tk_df
+            except (KeyError, TypeError):
+                continue
+
+        if len(chunks) > 1:
+            log.info(f"  Chunk {ci+1}/{len(chunks)}: got {sum(1 for t in chunk if t in result)}/{len(chunk)} tickers")
 
     return result
 
@@ -561,8 +584,14 @@ def v5_scan(tickers_by_sector=None, top_n=2, personal_watchlist=None, allow_intr
         pw_data = fetch_bulk(personal_watchlist, start, end)
         pw_data, _, _ = _drop_today_if_incomplete(pw_data, keep_intraday=allow_intraday)
 
+        # For large watchlists, skip individual yfinance sector lookups (too slow)
+        use_fast_sector = len(personal_watchlist) > 50
+
         for tk in personal_watchlist:
-            sec = _TICKER_TO_SECTOR.get(tk, get_sector_for_ticker(tk))
+            if use_fast_sector:
+                sec = _TICKER_TO_SECTOR.get(tk, 'XLK')
+            else:
+                sec = _TICKER_TO_SECTOR.get(tk, get_sector_for_ticker(tk))
             sec_in_top = sec in allowed_sectors
             sec_up = sector_uptrend.get(sec, False)
 
